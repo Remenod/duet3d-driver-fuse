@@ -1,0 +1,552 @@
+#!/usr/bin/env bash
+# duet-mount — convenient mounting/unmounting of Duet RRF printers through duet-httpfs.
+#
+# Usage:
+#   duet-mount mount   [ALIAS|all]      # mount one printer, all printers, or show an interactive menu
+#   duet-mount umount  [ALIAS|all]      # unmount one printer, all printers, or show an interactive menu
+#   duet-mount status                   # show configured printers and mount state
+#   duet-mount list                     # same as status
+#   duet-mount add     ALIAS URL [ROOT] # add a printer to the config
+#   duet-mount remove  ALIAS            # remove a printer from the config
+#   duet-mount edit                     # open the config in $EDITOR
+#   duet-mount log     [ALIAS]          # follow a duet-httpfs log file
+#
+# Config: ~/.config/duet-mount/printers.conf
+# Logs:   /tmp/duet-httpfs-ALIAS.log
+
+set -euo pipefail
+
+# ─── Colors ──────────────────────────────────────────────────────────────────
+
+# Use real ANSI escape characters, not literal "\033" text. This fixes color
+# output inside printf/heredoc blocks such as usage().
+if [[ -n "${NO_COLOR:-}" ]]; then
+    RED='' YLW='' GRN='' CYN='' BLD='' RST=''
+elif [[ -t 1 || "${FORCE_COLOR:-0}" == "1" ]]; then
+    RED=$'\033[0;31m'
+    YLW=$'\033[0;33m'
+    GRN=$'\033[0;32m'
+    CYN=$'\033[0;36m'
+    BLD=$'\033[1m'
+    RST=$'\033[0m'
+else
+    RED='' YLW='' GRN='' CYN='' BLD='' RST=''
+fi
+
+# ─── Utility functions ───────────────────────────────────────────────────────
+
+die()  { printf '%serror:%s %s\n' "$RED" "$RST" "$*" >&2; exit 1; }
+info() { printf '%s::%s %s\n' "$CYN" "$RST" "$*"; }
+ok()   { printf '%s✓%s  %s\n' "$GRN" "$RST" "$*"; }
+warn() { printf '%s⚠%s  %s\n' "$YLW" "$RST" "$*"; }
+
+trim() {
+    local s="$*"
+    s="${s#"${s%%[![:space:]]*}"}"
+    s="${s%"${s##*[![:space:]]}"}"
+    printf '%s' "$s"
+}
+
+# Read a value from a config line: ALIAS|URL|ROOT|MOUNTPOINT|PASSWORD|EXTRA_OPTS
+field() { printf '%s\n' "$1" | cut -d'|' -f"$2"; }
+
+# Interactive selection menu.
+choose() {
+    local prompt="$1"; shift
+    local items=("$@")
+    local i num
+
+    printf '%s%s%s\n' "$BLD" "$prompt" "$RST"
+    for i in "${!items[@]}"; do
+        printf '  %2d)  %s\n' "$((i + 1))" "${items[$i]}"
+    done
+
+    while true; do
+        read -rp "Enter number [1-${#items[@]}]: " num
+        if [[ "$num" =~ ^[0-9]+$ ]] && (( num >= 1 && num <= ${#items[@]} )); then
+            CHOSEN="${items[$((num - 1))]}"
+            return 0
+        fi
+        warn "Invalid number, try again."
+    done
+}
+
+# ─── Paths ───────────────────────────────────────────────────────────────────
+
+if command -v realpath >/dev/null 2>&1; then
+    SELF="$(realpath "$0")"
+else
+    SELF="$0"
+fi
+SCRIPT_DIR="$(cd -- "$(dirname -- "$SELF")" && pwd -P)"
+
+CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/duet-mount"
+CONF_FILE="$CONF_DIR/printers.conf"
+MOUNT_BASE="$HOME/duet"
+DRIVER=''
+
+find_driver() {
+    if [[ -n "$DRIVER" && -x "$DRIVER" ]]; then
+        return 0
+    fi
+
+    if [[ -x "$SCRIPT_DIR/duet-httpfs" ]]; then
+        DRIVER="$SCRIPT_DIR/duet-httpfs"
+        return 0
+    fi
+
+    if command -v duet-httpfs >/dev/null 2>&1; then
+        DRIVER="$(command -v duet-httpfs)"
+        return 0
+    fi
+
+    return 1
+}
+
+require_driver() {
+    find_driver || die "duet-httpfs was not found. Put it next to this script or install it in PATH."
+}
+
+# ─── Config initialization ───────────────────────────────────────────────────
+
+init_conf() {
+    mkdir -p "$CONF_DIR" "$MOUNT_BASE"
+
+    if [[ ! -f "$CONF_FILE" ]]; then
+        cat > "$CONF_FILE" <<'CONFIG_EOF'
+# duet-mount — printer config
+#
+# Line format. Fields are separated by |:
+#   ALIAS | URL | ROOT | MOUNTPOINT | PASSWORD | EXTRA_OPTS
+#
+# ALIAS      — short name. Use Latin letters, digits, dash, or underscore.
+# URL        — http://IP:PORT
+# ROOT       — remote root on the printer, usually /
+# MOUNTPOINT — local mount point. Empty value means ~/duet/ALIAS
+# PASSWORD   — printer password. Leave empty if the printer has no password.
+# EXTRA_OPTS — additional duet-httpfs flags, for example --cache-mb=128
+#
+# Examples:
+# ender|http://192.168.0.110:80|/|||
+# voron|http://192.168.0.120:80|/||secret|--cache-mb=512 --dir-ttl=3
+# lab|http://10.20.30.40:8080|/gcodes|/mnt/lab-printer||
+CONFIG_EOF
+        info "Created config: $CONF_FILE"
+    fi
+}
+
+# ─── Config reading ──────────────────────────────────────────────────────────
+
+# Return config lines, ignoring comments and empty lines.
+conf_lines() {
+    [[ -f "$CONF_FILE" ]] || return 0
+    awk 'NF && $0 !~ /^[[:space:]]*#/' "$CONF_FILE" || true
+}
+
+# Find a config line by alias.
+conf_get() {
+    local wanted="$1"
+    local al url root mp pass extra
+
+    while IFS='|' read -r al url root mp pass extra; do
+        al="$(trim "${al:-}")"
+        if [[ "$al" == "$wanted" ]]; then
+            printf '%s|%s|%s|%s|%s|%s\n' \
+                "$al" \
+                "$(trim "${url:-}")" \
+                "$(trim "${root:-}")" \
+                "$(trim "${mp:-}")" \
+                "$(trim "${pass:-}")" \
+                "${extra:-}"
+            return 0
+        fi
+    done < <(conf_lines)
+
+    return 1
+}
+
+# List all configured aliases.
+conf_aliases() {
+    local al rest
+    while IFS='|' read -r al rest; do
+        al="$(trim "${al:-}")"
+        [[ -n "$al" ]] && printf '%s\n' "$al"
+    done < <(conf_lines)
+}
+
+# ─── Mount status ────────────────────────────────────────────────────────────
+
+is_mounted() {
+    local mp="$1"
+    mountpoint -q "$mp" 2>/dev/null
+}
+
+# PID of the duet-httpfs process that appears to be mounting the given mount point.
+driver_pid() {
+    local mp="$1"
+    pgrep -f "duet-httpfs.*$mp" 2>/dev/null | head -1 || true
+}
+
+# ─── Commands ────────────────────────────────────────────────────────────────
+
+cmd_list() {
+    init_conf
+
+    local lines
+    lines="$(conf_lines)" || true
+
+    if [[ -z "$lines" ]]; then
+        warn "Config is empty. Add a printer: $0 add ALIAS URL"
+        return 0
+    fi
+
+    printf '\n%s%-14s %-28s %-10s %-30s %s%s\n' \
+        "$BLD" "ALIAS" "URL" "ROOT" "MOUNTPOINT" "STATUS" "$RST"
+    printf '%s\n' "$(printf '─%.0s' {1..90})"
+
+    local alias url root mp pass extra status
+    while IFS='|' read -r alias url root mp pass extra; do
+        alias="$(trim "${alias:-}")"
+        url="$(trim "${url:-}")"
+        root="$(trim "${root:-}")"
+        mp="$(trim "${mp:-}")"
+        [[ -z "$mp" ]] && mp="$MOUNT_BASE/$alias"
+
+        if is_mounted "$mp"; then
+            status="${GRN}mounted${RST}"
+        else
+            status="${YLW}not mounted${RST}"
+        fi
+
+        printf '%-14s %-28s %-10s %-30s %s\n' "$alias" "$url" "${root:-/}" "$mp" "$status"
+    done <<< "$lines"
+
+    printf '\n'
+}
+
+cmd_status() { cmd_list; }
+
+cmd_add() {
+    init_conf
+
+    local alias="${1:-}"
+    local url="${2:-}"
+    local root="${3:-}"
+    local mp="${4:-}"
+    local pass="${5:-}"
+    local extra="${6:-}"
+    local input_root input_mp default_mp
+
+    if [[ -z "$alias" ]]; then
+        read -rp "Alias, for example ender or voron: " alias
+    fi
+    [[ "$alias" =~ ^[a-zA-Z0-9_-]+$ ]] || die "Alias may contain only Latin letters, digits, dash, and underscore."
+
+    if conf_get "$alias" >/dev/null 2>&1; then
+        die "Alias '$alias' already exists. Remove it first: $0 remove $alias"
+    fi
+
+    if [[ -z "$url" ]]; then
+        read -rp "Printer URL, for example http://IP:PORT: " url
+    fi
+    [[ "$url" =~ ^https?:// ]] || die "URL must start with http:// or https://"
+
+    if [[ -z "$root" ]]; then
+        read -rp "Remote root [/]: " input_root
+        root="${input_root:-/}"
+    fi
+
+    if [[ -z "$mp" ]]; then
+        default_mp="$MOUNT_BASE/$alias"
+        read -rp "Mount point [$default_mp]: " input_mp
+        mp="${input_mp:-$default_mp}"
+    fi
+
+    if [[ -z "$pass" ]]; then
+        read -rsp "Password, press Enter if none: " pass
+        printf '\n'
+    fi
+
+    if [[ -z "$extra" ]]; then
+        read -rp "Additional duet-httpfs options, press Enter to skip: " extra
+    fi
+
+    printf '%s|%s|%s|%s|%s|%s\n' "$alias" "$url" "$root" "$mp" "$pass" "$extra" >> "$CONF_FILE"
+    mkdir -p "$mp"
+
+    ok "Printer '${BLD}${alias}${RST}' was added."
+    ok "Mount point: $mp"
+}
+
+cmd_remove() {
+    init_conf
+
+    local alias="${1:-}"
+    local tmp
+
+    if [[ -z "$alias" ]]; then
+        local aliases=()
+        while IFS= read -r a; do aliases+=("$a"); done < <(conf_aliases)
+        [[ ${#aliases[@]} -eq 0 ]] && die "Config is empty."
+        choose "Which printer should be removed?" "${aliases[@]}"
+        alias="$CHOSEN"
+    fi
+
+    # Unmount before removing, if currently mounted.
+    cmd_umount "$alias" 2>/dev/null || true
+
+    tmp="$(mktemp)"
+    awk -F'|' -v a="$alias" '
+        {
+            al = $1
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", al)
+            if (al != a) print $0
+        }
+    ' "$CONF_FILE" > "$tmp" || true
+    mv "$tmp" "$CONF_FILE"
+
+    ok "Printer '$alias' was removed from the config."
+}
+
+cmd_edit() {
+    init_conf
+    "${EDITOR:-nano}" "$CONF_FILE"
+}
+
+do_mount_one() {
+    local alias="$1"
+    local url="$2"
+    local root="$3"
+    local mp="$4"
+    local pass="$5"
+    local extra="$6"
+    local log pid i
+    local opts=()
+
+    require_driver
+    mkdir -p "$mp"
+
+    if is_mounted "$mp"; then
+        warn "'$alias' is already mounted at $mp"
+        return 0
+    fi
+
+    log="/tmp/duet-httpfs-${alias}.log"
+    info "Mounting ${BLD}${alias}${RST} ($url → $mp) ..."
+
+    [[ -n "$extra" ]] && read -r -a opts <<< "$extra"
+    opts+=("--log=${log}")
+
+    DUET_PASSWORD="$pass" DUET_ROOT="$root" \
+        nohup "$DRIVER" "$url" "$mp" "${opts[@]}" \
+        >/dev/null 2>&1 &
+
+    pid=$!
+
+    # Wait up to 5 seconds for FUSE to confirm the mount.
+    for i in {1..10}; do
+        sleep 0.5
+        if is_mounted "$mp"; then
+            ok "${BLD}${alias}${RST} mounted ($mp) [pid $pid, log $log]"
+            return 0
+        fi
+    done
+
+    warn "Mounting '$alias' was not confirmed within 5 seconds. Check the log: $log"
+    tail -20 "$log" 2>/dev/null | sed 's/^/  /' || true
+}
+
+cmd_mount() {
+    init_conf
+
+    local alias="${1:-}"
+    local line al url root mp pass extra
+
+    if [[ -z "$alias" ]]; then
+        local aliases=()
+        while IFS= read -r a; do aliases+=("$a"); done < <(conf_aliases)
+        [[ ${#aliases[@]} -eq 0 ]] && die "Config is empty. Add a printer: $0 add"
+        aliases+=("all")
+        choose "Which printer should be mounted?" "${aliases[@]}"
+        alias="$CHOSEN"
+    fi
+
+    if [[ "$alias" == "all" ]]; then
+        while IFS='|' read -r al url root mp pass extra; do
+            al="$(trim "${al:-}")"
+            url="$(trim "${url:-}")"
+            root="$(trim "${root:-}")"
+            mp="$(trim "${mp:-}")"
+            pass="$(trim "${pass:-}")"
+            [[ -z "$mp" ]] && mp="$MOUNT_BASE/$al"
+            do_mount_one "$al" "$url" "${root:-/}" "$mp" "$pass" "${extra:-}"
+        done < <(conf_lines)
+        return 0
+    fi
+
+    line="$(conf_get "$alias" || true)"
+    [[ -z "$line" ]] && die "Printer '$alias' was not found in the config."
+
+    IFS='|' read -r al url root mp pass extra <<< "$line"
+    al="$(trim "${al:-}")"
+    url="$(trim "${url:-}")"
+    root="$(trim "${root:-}")"
+    mp="$(trim "${mp:-}")"
+    pass="$(trim "${pass:-}")"
+    [[ -z "$mp" ]] && mp="$MOUNT_BASE/$al"
+
+    do_mount_one "$al" "$url" "${root:-/}" "$mp" "$pass" "${extra:-}"
+}
+
+do_umount_one() {
+    local alias="$1"
+    local mp="$2"
+
+    if ! is_mounted "$mp"; then
+        warn "'$alias' is not mounted ($mp)"
+        return 0
+    fi
+
+    info "Unmounting ${BLD}${alias}${RST} ($mp) ..."
+
+    if command -v fusermount3 >/dev/null 2>&1; then
+        fusermount3 -uz "$mp" 2>/dev/null || umount -l "$mp" 2>/dev/null \
+            || die "Failed to unmount $mp. Try: fusermount3 -uz $mp"
+    elif command -v fusermount >/dev/null 2>&1; then
+        fusermount -uz "$mp" 2>/dev/null || umount -l "$mp" 2>/dev/null \
+            || die "Failed to unmount $mp. Try: fusermount -uz $mp"
+    else
+        umount -l "$mp" 2>/dev/null \
+            || die "Failed to unmount $mp. Install fuse tools or run: umount -l $mp"
+    fi
+
+    ok "${BLD}${alias}${RST} unmounted."
+}
+
+cmd_umount() {
+    init_conf
+
+    local alias="${1:-}"
+    local line al mp
+
+    if [[ -z "$alias" ]]; then
+        local mounted=()
+        while IFS='|' read -r al _ _ mp _ _; do
+            al="$(trim "${al:-}")"
+            mp="$(trim "${mp:-}")"
+            [[ -z "$mp" ]] && mp="$MOUNT_BASE/$al"
+            is_mounted "$mp" && mounted+=("$al")
+        done < <(conf_lines)
+
+        if [[ ${#mounted[@]} -eq 0 ]]; then
+            warn "Nothing is mounted."
+            return 0
+        fi
+
+        mounted+=("all")
+        choose "What should be unmounted?" "${mounted[@]}"
+        alias="$CHOSEN"
+    fi
+
+    if [[ "$alias" == "all" ]]; then
+        while IFS='|' read -r al _ _ mp _ _; do
+            al="$(trim "${al:-}")"
+            mp="$(trim "${mp:-}")"
+            [[ -z "$mp" ]] && mp="$MOUNT_BASE/$al"
+            is_mounted "$mp" && do_umount_one "$al" "$mp"
+        done < <(conf_lines)
+        return 0
+    fi
+
+    line="$(conf_get "$alias" || true)"
+    [[ -z "$line" ]] && die "Printer '$alias' was not found in the config."
+
+    IFS='|' read -r al _ _ mp _ _ <<< "$line"
+    al="$(trim "${al:-}")"
+    mp="$(trim "${mp:-}")"
+    [[ -z "$mp" ]] && mp="$MOUNT_BASE/$al"
+
+    do_umount_one "$al" "$mp"
+}
+
+cmd_log() {
+    init_conf
+
+    local alias="${1:-}"
+    local log
+
+    if [[ -z "$alias" ]]; then
+        local aliases=()
+        while IFS= read -r a; do aliases+=("$a"); done < <(conf_aliases)
+        [[ ${#aliases[@]} -eq 0 ]] && die "Config is empty."
+        choose "Which printer log should be followed?" "${aliases[@]}"
+        alias="$CHOSEN"
+    fi
+
+    log="/tmp/duet-httpfs-${alias}.log"
+    [[ -f "$log" ]] || die "Log not found: $log"
+    tail -f "$log"
+}
+
+# ─── Help ────────────────────────────────────────────────────────────────────
+
+usage() {
+    local driver_display
+
+    if find_driver; then
+        driver_display="$DRIVER"
+    else
+        driver_display="not found; expected next to this script or in PATH"
+    fi
+
+    cat <<USAGE_EOF
+
+${BLD}duet-mount${RST} — mount Duet RRF printers through duet-httpfs
+
+${BLD}USAGE${RST}
+  $(basename "$0") <command> [arguments]
+
+${BLD}COMMANDS${RST}
+  ${CYN}mount${RST}   [alias|all]   Mount a printer. Shows an interactive menu when alias is omitted.
+  ${CYN}umount${RST}  [alias|all]   Unmount a printer. Shows an interactive menu when alias is omitted.
+  ${CYN}status${RST}               Show the status of all configured printers.
+  ${CYN}list${RST}                 Same as status.
+  ${CYN}add${RST}    [alias url]   Add a printer to the config.
+  ${CYN}remove${RST} [alias]       Remove a printer from the config.
+  ${CYN}edit${RST}                 Open the config in \$EDITOR.
+  ${CYN}log${RST}    [alias]       Follow the printer log with tail -f.
+
+${BLD}EXAMPLES${RST}
+  $(basename "$0") add ender http://192.168.0.110:80
+  $(basename "$0") mount ender
+  $(basename "$0") mount all
+  $(basename "$0") umount ender
+  $(basename "$0") status
+
+${BLD}CONFIG${RST}  $CONF_FILE
+${BLD}DRIVER${RST}  $driver_display
+
+USAGE_EOF
+}
+
+# ─── Dispatcher ──────────────────────────────────────────────────────────────
+
+main() {
+    local cmd="${1:-help}"
+    shift 2>/dev/null || true
+
+    case "$cmd" in
+        mount|m)       cmd_mount  "$@" ;;
+        umount|u|un)   cmd_umount "$@" ;;
+        status|s)      cmd_status ;;
+        list|l)        cmd_list ;;
+        add|a)         cmd_add "$@" ;;
+        remove|rm|r)   cmd_remove "$@" ;;
+        edit|e)        cmd_edit ;;
+        log)           cmd_log "$@" ;;
+        help|-h|--help) usage ;;
+        *) warn "Unknown command: $cmd"; usage; exit 1 ;;
+    esac
+}
+
+main "$@"
