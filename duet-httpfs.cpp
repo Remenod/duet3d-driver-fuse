@@ -216,6 +216,54 @@ static std::string normalize_base_url(std::string url) {
 }
 
 // ╔═══════════════════════════════════════════════════════════════════════════╗
+// ║  HTTP concurrency limiter                                                ║
+// ║                                                                          ║
+// ║  RepRapFirmware runs on a single-core MCU and serves HTTP from a small  ║
+// ║  number of internal worker slots. Hammering it with many parallel       ║
+// ║  requests (as happens during `cp -r` of hundreds of files through a    ║
+// ║  multi-threaded FUSE) causes the firmware to return malformed/empty    ║
+// ║  responses or HTTP 503. We cap concurrent HTTP requests to a small     ║
+// ║  number to keep the printer happy while still benefiting from          ║
+// ║  multi-threaded FUSE on the local side (cache hits, etc.).             ║
+// ╚═══════════════════════════════════════════════════════════════════════════╝
+
+class HttpSemaphore {
+public:
+    explicit HttpSemaphore(int max) : permits_(max) {}
+    void acquire() {
+        std::unique_lock lk(mtx_);
+        cv_.wait(lk, [this] { return permits_ > 0; });
+        --permits_;
+    }
+    void release() {
+        {
+            std::lock_guard lk(mtx_);
+            ++permits_;
+        }
+        cv_.notify_one();
+    }
+private:
+    std::mutex              mtx_;
+    std::condition_variable cv_;
+    int                     permits_;
+};
+
+class HttpPermit {
+public:
+    explicit HttpPermit(HttpSemaphore& s) : s_(s) { s_.acquire(); }
+    ~HttpPermit() { s_.release(); }
+    HttpPermit(const HttpPermit&)            = delete;
+    HttpPermit& operator=(const HttpPermit&) = delete;
+private:
+    HttpSemaphore& s_;
+};
+
+// Global limiter: RRF tolerates 2-3 concurrent HTTP requests reliably.
+// We use 2 to be conservative — the bottleneck is the printer, not the
+// network, so adding more parallelism doesn't help anyway.
+static HttpSemaphore g_http_sem(2);
+
+// ╔═══════════════════════════════════════════════════════════════════════════╗
 // ║  Session — Duet rr_connect / X-Session-Key management                   ║
 // ╚═══════════════════════════════════════════════════════════════════════════╝
 
@@ -245,6 +293,8 @@ private:
 
     bool do_connect() {
         // Called with mtx_ held
+        HttpPermit permit(g_http_sem);
+
         CURL* c   = get_curl();
         std::string url = base_ + "/rr_connect?password=" +
                           url_encode(pw_) + "&sessionKey=yes";
@@ -291,6 +341,9 @@ private:
                           const std::vector<uint8_t>& body,
                           const std::string& key)
     {
+        // Throttle global HTTP concurrency — see HttpSemaphore comment.
+        HttpPermit permit(g_http_sem);
+
         std::string url = base_ + ep + (qs.empty() ? "" : "?" + qs);
         std::vector<uint8_t> buf;
 
@@ -340,16 +393,33 @@ private:
 
         auto r = do_request(c, method, ep, qs, body, key);
 
-        // Retry on 401 (expired session) or transport error (network hiccup /
-        // connection broken after NAT/forward change)
-        if (r.code == 401 || r.code == -1) {
-            logf("[http] retry after code=%ld (%s %s)\n",
-                 r.code, method.c_str(), ep.c_str());
-            {
-                std::unique_lock lk(mtx_);
-                do_connect();
-                key = session_key_;
+        // Retry on:
+        //   401 → expired session, reconnect.
+        //   -1  → transport error, may need fresh connection.
+        //   503 → RRF busy (returned during heavy I/O or while another
+        //         file operation is in flight). Back off and retry.
+        // We retry up to 5 times with exponential backoff capped at 1 s.
+        // This is critical for `cp -r` style workloads where the printer
+        // can momentarily refuse to serve a request.
+        int attempts = 0;
+        while ((r.code == 401 || r.code == -1 || r.code == 503) && attempts < 5) {
+            ++attempts;
+            int backoff_ms = std::min(50 * (1 << (attempts - 1)), 1000);
+            if (r.code == 401 || r.code == -1) {
+                logf("[http] retry %d after code=%ld (%s %s)\n",
+                     attempts, r.code, method.c_str(), ep.c_str());
+                {
+                    std::unique_lock lk(mtx_);
+                    do_connect();
+                    key = session_key_;
+                }
+            } else {
+                // 503: printer busy. Just wait.
+                logf("[http] retry %d (busy 503) after %d ms (%s %s)\n",
+                     attempts, backoff_ms, method.c_str(), ep.c_str());
             }
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(backoff_ms));
             r = do_request(c, method, ep, qs, body, key);
         }
         return r;
@@ -364,7 +434,8 @@ struct FileData {
     std::vector<uint8_t>                buf;
     std::atomic<bool>                   dirty{false};
     std::chrono::steady_clock::time_point mtime{std::chrono::steady_clock::now()};
-    mutable std::mutex                  mtx;  // guards buf, mtime
+    mutable std::mutex                  mtx;       // guards buf, mtime, write_gen
+    uint64_t                            write_gen = 0;  // bumped on every modification
 };
 
 class FileCache {
@@ -595,6 +666,7 @@ public:
     {
         auto fd   = std::make_shared<FileData>();
         fd->dirty = true;
+        ++fd->write_gen;
         fcache_.put(path, fd);
         dcache_.invalidate(parent(path));
         return 0;
@@ -621,9 +693,27 @@ public:
         try {
             auto fd = fcache_.get(path);
             if (!fd) {
-                fd = std::make_shared<FileData>();
-                try { download_into(path, *fd); } catch (...) { /* new file */ }
-                fcache_.put(path, fd);
+                // Try to pre-load the file. Use the same per-path lock so
+                // we don't race with parallel writers/readers.
+                auto pl = get_path_lock(path);
+                std::lock_guard plk(*pl);
+                fd = fcache_.get(path);     // re-check under lock
+                if (!fd) {
+                    auto nfd = std::make_shared<FileData>();
+                    bool have_existing = false;
+                    try {
+                        download_into(path, *nfd);
+                        have_existing = true;
+                    } catch (const std::system_error& e) {
+                        // 404 → new file, start empty. Any other error
+                        // must NOT be swallowed: bail out so we don't
+                        // poison the cache with bogus data.
+                        if (e.code().value() != ENOENT) throw;
+                    }
+                    (void)have_existing;
+                    fcache_.put(path, nfd);
+                    fd = nfd;
+                }
             }
             {
                 std::lock_guard lk(fd->mtx);
@@ -632,6 +722,7 @@ public:
                 std::memcpy(fd->buf.data() + offset, buf, size);
                 fd->dirty = true;
                 fd->mtime = std::chrono::steady_clock::now();
+                ++fd->write_gen;
             }
             fcache_.notify_resize(path, fd->buf.size());
             return (int)size;
@@ -646,15 +737,26 @@ public:
         try {
             auto fd = fcache_.get(path);
             if (!fd) {
-                fd = std::make_shared<FileData>();
-                try { download_into(path, *fd); } catch (...) {}
-                fcache_.put(path, fd);
+                auto pl = get_path_lock(path);
+                std::lock_guard plk(*pl);
+                fd = fcache_.get(path);
+                if (!fd) {
+                    auto nfd = std::make_shared<FileData>();
+                    try {
+                        download_into(path, *nfd);
+                    } catch (const std::system_error& e) {
+                        if (e.code().value() != ENOENT) throw;
+                    }
+                    fcache_.put(path, nfd);
+                    fd = nfd;
+                }
             }
             {
                 std::lock_guard lk(fd->mtx);
                 fd->buf.resize((size_t)length, 0);
                 fd->dirty = true;
                 fd->mtime = std::chrono::steady_clock::now();
+                ++fd->write_gen;
             }
             fcache_.notify_resize(path, (size_t)length);
             return 0;
@@ -673,8 +775,10 @@ public:
     }
 
     int op_release(const char* path, struct fuse_file_info* /*fi*/) noexcept {
-        // Async: release returns immediately; background thread uploads
-        enqueue_upload(path);
+        // Only schedule an upload if the file is actually dirty. A plain
+        // read-only open should not generate any HTTP traffic on close.
+        auto fd = fcache_.get(path);
+        if (fd && fd->dirty.load()) enqueue_upload(path);
         return 0;
     }
 
@@ -755,6 +859,21 @@ private:
     DirCache    dcache_;
     uid_t uid_;
     gid_t gid_;
+
+    // ── Per-path locks: serialize concurrent downloads of the same file
+    //    so two FUSE threads don't hammer the printer with redundant
+    //    requests and don't race on cache insertion.
+    std::mutex                                       path_locks_mtx_;
+    std::unordered_map<std::string, std::shared_ptr<std::mutex>> path_locks_;
+
+    std::shared_ptr<std::mutex> get_path_lock(const std::string& p) {
+        std::lock_guard lk(path_locks_mtx_);
+        auto it = path_locks_.find(p);
+        if (it != path_locks_.end()) return it->second;
+        auto m = std::make_shared<std::mutex>();
+        path_locks_[p] = m;
+        return m;
+    }
 
     // ── Async upload queue ────────────────────────────────────────────────
     std::thread              upload_thread_;
@@ -930,13 +1049,17 @@ private:
             st->st_nlink = 1;
             st->st_size  = info.size;
 
-            // Override with cached data (accurate after write/truncate)
+            // Only override st_size with cached data if cached entry has
+            // been written to (dirty) — i.e. it represents real new data.
+            // Otherwise a stale/empty cache entry would corrupt readers.
             if (auto fd = fcache_.get(std::string(path))) {
-                std::lock_guard lk(fd->mtx);
-                st->st_size = (off_t)fd->buf.size();
-                auto dur    = fd->mtime.time_since_epoch();
-                st->st_mtime = st->st_ctime =
-                    std::chrono::duration_cast<std::chrono::seconds>(dur).count();
+                if (fd->dirty.load()) {
+                    std::lock_guard lk(fd->mtx);
+                    st->st_size = (off_t)fd->buf.size();
+                    auto dur    = fd->mtime.time_since_epoch();
+                    st->st_mtime = st->st_ctime =
+                        std::chrono::duration_cast<std::chrono::seconds>(dur).count();
+                }
             }
         }
     }
@@ -948,6 +1071,29 @@ private:
                            "name=" + url_encode(remote(local)));
         if (r.code == 404) throw_noent();
         if (r.code != 200) throw_io();
+
+        // Sanity check: if the directory listing has the file with a
+        // non-zero size but we got an empty body, the printer almost
+        // certainly aborted mid-transfer. Don't accept the truncated
+        // data — that would poison the cache and corrupt readers.
+        // We compare against the cached dir entry rather than re-listing
+        // (which would burn an extra HTTP round-trip).
+        int64_t expected = -1;
+        try {
+            const std::string par  = parent(local);
+            const std::string name = basename_of(local);
+            if (auto entries = dcache_.get(par)) {
+                for (const auto& e : *entries)
+                    if (e.name == name) { expected = e.size; break; }
+            }
+        } catch (...) { /* best-effort, ignore */ }
+
+        if (expected > 0 && (int64_t)r.body.size() != expected) {
+            logf("[download] %s: size mismatch (got %zu, expected %lld)\n",
+                 local.c_str(), r.body.size(), (long long)expected);
+            throw_io();
+        }
+
         std::lock_guard lk(fd.mtx);
         fd.buf.assign(r.body.begin(), r.body.end());
         fd.dirty = false;
@@ -955,10 +1101,18 @@ private:
     }
 
     std::shared_ptr<FileData> ensure_cached(const std::string& local) {
-        auto fd = fcache_.get(local);
-        if (fd) return fd;
-        fd = std::make_shared<FileData>();
-        download_into(local, *fd);
+        // Fast path: already in cache.
+        if (auto fd = fcache_.get(local)) return fd;
+
+        // Slow path: serialize concurrent downloads of the same file.
+        auto pl = get_path_lock(local);
+        std::lock_guard plk(*pl);
+
+        // Re-check under the lock (another thread may have just filled it).
+        if (auto fd = fcache_.get(local)) return fd;
+
+        auto fd = std::make_shared<FileData>();
+        download_into(local, *fd);    // throws on error — propagates up
         fcache_.put(local, fd);
         return fd;
     }
@@ -968,11 +1122,14 @@ private:
     {
         if (!fd->dirty.load()) return;
 
-        // Snapshot data under lock so concurrent writes are safe
+        // Snapshot data under lock and capture the write generation so
+        // we can detect whether any concurrent write happened.
         std::vector<uint8_t> data;
+        uint64_t              gen_before;
         {
             std::lock_guard lk(fd->mtx);
-            data = fd->buf;
+            data       = fd->buf;
+            gen_before = fd->write_gen;
         }
 
         auto r = sess_.post("/rr_upload",
@@ -992,10 +1149,18 @@ private:
             }
         } catch (const json::parse_error&) { /* non-JSON body is ok */ }
 
-        // Only clear dirty if no concurrent write changed the buffer
-        fd->dirty.store(false);
+        // Clear `dirty` only if no write happened during the upload.
+        // Otherwise the next flush/release will re-upload the new data.
         {
             std::lock_guard lk(fd->mtx);
+            if (fd->write_gen == gen_before) {
+                fd->dirty.store(false);
+            } else {
+                logf("[upload] %s: write occurred during upload, "
+                     "leaving dirty=true (will re-upload)\n", local.c_str());
+                // Make sure the worker re-tries.
+                enqueue_upload(local);
+            }
             fd->mtime = std::chrono::steady_clock::now();
         }
         dcache_.invalidate(parent(local));
