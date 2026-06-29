@@ -187,6 +187,26 @@ driver_pid() {
     pgrep -f "duet-httpfs.*$mp" 2>/dev/null | head -1 || true
 }
 
+# All duet-httpfs driver PIDs bound to a given mount point. Uses `pgrep -x`
+# (exact process name) so it can never match this script or pgrep itself —
+# matching by full command line risks killing the wrong process. Each candidate
+# is then confirmed by checking its /proc cmdline contains the mount point.
+driver_pids() {
+    local mp="$1" p cmd out=""
+    while read -r p; do
+        [[ -z "$p" ]] && continue
+        cmd="$(tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null)"
+        [[ "$cmd" == *"$mp"* ]] && out+="$p "
+    done < <(pgrep -x duet-httpfs 2>/dev/null || true)
+    printf '%s' "$out"
+}
+
+# Signal every driver process for a mount point ($2 = signal, default TERM).
+kill_drivers() {
+    local mp="$1" sig="${2:-TERM}" p
+    for p in $(driver_pids "$mp"); do kill "-$sig" "$p" 2>/dev/null || true; done
+}
+
 # ─── Commands ────────────────────────────────────────────────────────────────
 
 cmd_list() {
@@ -401,26 +421,52 @@ cmd_mount() {
 do_umount_one() {
     local alias="$1"
     local mp="$2"
+    local i
 
-    if ! is_mounted "$mp"; then
-        warn "'$alias' is not mounted ($mp)"
-        return 0
-    fi
+    if is_mounted "$mp"; then
+        info "Unmounting ${BLD}${alias}${RST} ($mp) ..."
 
-    info "Unmounting ${BLD}${alias}${RST} ($mp) ..."
-
-    if command -v fusermount3 >/dev/null 2>&1; then
-        fusermount3 -uz "$mp" 2>/dev/null || umount -l "$mp" 2>/dev/null \
-            || die "Failed to unmount $mp. Try: fusermount3 -uz $mp"
-    elif command -v fusermount >/dev/null 2>&1; then
-        fusermount -uz "$mp" 2>/dev/null || umount -l "$mp" 2>/dev/null \
-            || die "Failed to unmount $mp. Try: fusermount -uz $mp"
+        # Prefer a CLEAN unmount; only fall back to a lazy one when the mount is
+        # busy (typically a shell whose cwd is inside it). A lazy unmount only
+        # detaches the path — the driver keeps running and serving that stale
+        # reference, so old processes used to pile up across remounts and a
+        # shell with a stale cwd kept hitting an outdated build. We always
+        # follow up by reaping the driver below.
+        if command -v fusermount3 >/dev/null 2>&1; then
+            fusermount3 -u "$mp" 2>/dev/null || umount "$mp" 2>/dev/null \
+                || fusermount3 -uz "$mp" 2>/dev/null || umount -l "$mp" 2>/dev/null \
+                || die "Failed to unmount $mp. Try: fusermount3 -uz $mp"
+        elif command -v fusermount >/dev/null 2>&1; then
+            fusermount -u "$mp" 2>/dev/null || umount "$mp" 2>/dev/null \
+                || fusermount -uz "$mp" 2>/dev/null || umount -l "$mp" 2>/dev/null \
+                || die "Failed to unmount $mp. Try: fusermount -uz $mp"
+        else
+            umount "$mp" 2>/dev/null || umount -l "$mp" 2>/dev/null \
+                || die "Failed to unmount $mp. Install fuse tools or run: umount -l $mp"
+        fi
     else
-        umount -l "$mp" 2>/dev/null \
-            || die "Failed to unmount $mp. Install fuse tools or run: umount -l $mp"
+        warn "'$alias' is not mounted ($mp)"
     fi
 
-    ok "${BLD}${alias}${RST} unmounted."
+    # Reap the driver. A cleanly-unmounted driver exits on its own after
+    # flushing dirty files, so give it a grace period first; only force-kill
+    # the ones that linger (the lazy-unmount-on-busy case). This is what stops
+    # stale processes from accumulating.
+    for i in 1 2 3 4 5 6; do
+        [[ -z "$(driver_pids "$mp")" ]] && break
+        sleep 0.5
+    done
+    if [[ -n "$(driver_pids "$mp")" ]]; then
+        kill_drivers "$mp" TERM
+        sleep 0.5
+        kill_drivers "$mp" KILL
+    fi
+
+    if [[ -n "$(driver_pids "$mp")" ]]; then
+        warn "A duet-httpfs process for $mp is still running; check manually."
+    else
+        ok "${BLD}${alias}${RST} unmounted."
+    fi
 }
 
 cmd_umount() {
