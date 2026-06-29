@@ -35,10 +35,12 @@ fi
 
 # ─── Utility functions ───────────────────────────────────────────────────────
 
-die()  { printf '%serror:%s %s\n' "$RED" "$RST" "$*" >&2; exit 1; }
-info() { printf '%s::%s %s\n' "$CYN" "$RST" "$*"; }
-ok()   { printf '%s✓%s  %s\n' "$GRN" "$RST" "$*"; }
-warn() { printf '%s⚠%s  %s\n' "$YLW" "$RST" "$*"; }
+# Diagnostics go to stderr so stdout carries only real data (status table,
+# alias lists) and stays pipeable. die's optional 2nd arg is the exit code.
+die()  { printf '%serror:%s %s\n' "$RED" "$RST" "$1" >&2; exit "${2:-1}"; }
+info() { [[ -n "${QUIET:-}" ]] || printf '%s::%s %s\n' "$CYN" "$RST" "$*" >&2; }
+ok()   { [[ -n "${QUIET:-}" ]] || printf '%s✓%s  %s\n' "$GRN" "$RST" "$*" >&2; }
+warn() { printf '%s⚠%s  %s\n' "$YLW" "$RST" "$*" >&2; }
 
 trim() {
     local s="$*"
@@ -56,9 +58,14 @@ choose() {
     local items=("$@")
     local i num
 
-    printf '%s%s%s\n' "$BLD" "$prompt" "$RST"
+    # An interactive menu only makes sense on a terminal. In a pipe/script,
+    # fail loudly instead of blocking on read — the caller should pass an
+    # explicit argument.
+    [[ -t 0 ]] || die "no selection given and stdin is not a terminal — pass an explicit argument" 2
+
+    printf '%s%s%s\n' "$BLD" "$prompt" "$RST" >&2
     for i in "${!items[@]}"; do
-        printf '  %2d)  %s\n' "$((i + 1))" "${items[$i]}"
+        printf '  %2d)  %s\n' "$((i + 1))" "${items[$i]}" >&2
     done
 
     while true; do
@@ -373,7 +380,8 @@ do_mount_one() {
     done
 
     warn "Mounting '$alias' was not confirmed within 5 seconds. Check the log: $log"
-    tail -20 "$log" 2>/dev/null | sed 's/^/  /' || true
+    tail -20 "$log" 2>/dev/null | sed 's/^/  /' >&2 || true
+    return 1
 }
 
 cmd_mount() {
@@ -392,6 +400,7 @@ cmd_mount() {
     fi
 
     if [[ "$alias" == "all" ]]; then
+        local rc=0
         while IFS='|' read -r al url root mp pass extra; do
             al="$(trim "${al:-}")"
             url="$(trim "${url:-}")"
@@ -399,9 +408,9 @@ cmd_mount() {
             mp="$(trim "${mp:-}")"
             pass="$(trim "${pass:-}")"
             [[ -z "$mp" ]] && mp="$MOUNT_BASE/$al"
-            do_mount_one "$al" "$url" "${root:-/}" "$mp" "$pass" "${extra:-}"
+            do_mount_one "$al" "$url" "${root:-/}" "$mp" "$pass" "${extra:-}" || rc=1
         done < <(conf_lines)
-        return 0
+        return "$rc"
     fi
 
     line="$(conf_get "$alias" || true)"
@@ -550,7 +559,11 @@ usage() {
 ${BLD}duet-mount${RST} — mount Duet RRF printers through duet-httpfs
 
 ${BLD}USAGE${RST}
-  $(basename "$0") <command> [arguments]
+  $(basename "$0") [options] <command> [arguments]
+
+${BLD}OPTIONS${RST}
+  ${CYN}-q${RST}, ${CYN}--quiet${RST}    Suppress progress messages (errors and warnings still show).
+  ${CYN}-h${RST}, ${CYN}--help${RST}     Show this help and exit.
 
 ${BLD}COMMANDS${RST}
   ${CYN}mount${RST}   [alias|all]   Mount a printer. Shows an interactive menu when alias is omitted.
@@ -578,6 +591,18 @@ USAGE_EOF
 # ─── Dispatcher ──────────────────────────────────────────────────────────────
 
 main() {
+    # Global options may precede the command (GNU-style). --help and -h print
+    # usage to stdout and exit 0; an unknown option is a usage error (exit 2).
+    while [[ "${1:-}" == -?* ]]; do
+        case "$1" in
+            -h|--help)  usage; exit 0 ;;
+            -q|--quiet) QUIET=1; shift ;;
+            --)         shift; break ;;
+            *)          printf '%serror:%s unknown option: %s\n' "$RED" "$RST" "$1" >&2
+                        usage >&2; exit 2 ;;
+        esac
+    done
+
     local cmd="${1:-help}"
     shift 2>/dev/null || true
 
@@ -590,8 +615,9 @@ main() {
         remove|rm|r)   cmd_remove "$@" ;;
         edit|e)        cmd_edit ;;
         log)           cmd_log "$@" ;;
-        help|-h|--help) usage ;;
-        *) warn "Unknown command: $cmd"; usage; exit 1 ;;
+        help)          usage ;;
+        *)             printf '%serror:%s unknown command: %s\n' "$RED" "$RST" "$cmd" >&2
+                       usage >&2; exit 2 ;;
     esac
 }
 
