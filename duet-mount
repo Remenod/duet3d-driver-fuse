@@ -188,6 +188,17 @@ is_mounted() {
     mountpoint -q "$mp" 2>/dev/null
 }
 
+# True if the invoking shell's working directory is at or below a mount point.
+# Such a shell holds an open handle on the OLD filesystem instance, so once the
+# mount is torn down and replaced the shell is stranded on a dead directory
+# ("Transport endpoint is not connected") that no remount can heal — only a
+# fresh `cd` re-resolves the path. We can't change the caller's cwd from here,
+# but we can detect this and tell the user exactly what to run.
+caller_in_mount() {
+    local mp="$1" pwd="${PWD:-}"
+    [[ -n "$pwd" && ( "$pwd" == "$mp" || "$pwd" == "$mp"/* ) ]]
+}
+
 # PID of the duet-httpfs process that appears to be mounting the given mount point.
 driver_pid() {
     local mp="$1"
@@ -375,6 +386,9 @@ do_mount_one() {
         sleep 0.5
         if is_mounted "$mp"; then
             ok "${BLD}${alias}${RST} mounted ($mp) [pid $pid, log $log]"
+            if caller_in_mount "$mp"; then
+                warn "your shell is on a stale handle for this path — run:  cd \"$mp\""
+            fi
             return 0
         fi
     done
@@ -475,6 +489,11 @@ do_umount_one() {
         warn "A duet-httpfs process for $mp is still running; check manually."
     else
         ok "${BLD}${alias}${RST} unmounted."
+    fi
+
+    if caller_in_mount "$mp"; then
+        warn "your shell is inside $mp — that directory is now stale."
+        warn "cd out (e.g. cd ~), or after re-mounting run:  cd \"$mp\""
     fi
 }
 
